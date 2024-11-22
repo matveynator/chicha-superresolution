@@ -26,17 +26,13 @@ func main() {
 	http.HandleFunc("/", uploadPageHandler) // Render the upload page
 	http.HandleFunc("/upload", uploadHandler) // Handle file uploads
 
-	// Serve static files like Bootstrap CSS
-	http.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("static"))))
-
 	// Start the HTTP server
 	log.Println("Server running at http://localhost:8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
-// Upload page handler: displays the HTML page for image uploads
 func uploadPageHandler(w http.ResponseWriter, r *http.Request) {
-	// HTML template for the upload page
+	// Serve the HTML template with embedded CSS
 	const uploadPageHTML = `
 	<!DOCTYPE html>
 	<html lang="en">
@@ -44,7 +40,7 @@ func uploadPageHandler(w http.ResponseWriter, r *http.Request) {
 	<meta charset="UTF-8">
 	<meta name="viewport" content="width=device-width, initial-scale=1.0">
 	<title>Super Resolution</title>
-	<link href="/static/bootstrap.min.css" rel="stylesheet">
+	<style>%s</style>
 	</head>
 	<body class="bg-light">
 	<div class="container py-5">
@@ -62,11 +58,9 @@ func uploadPageHandler(w http.ResponseWriter, r *http.Request) {
 	</body>
 	</html>
 	`
-	// Serve the HTML template as a response
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(uploadPageHTML))
+	_, _ = fmt.Fprintf(w, uploadPageHTML, bootstrapCSS)
 }
-
 // uploadHandler processes uploaded images, validates their formats, and performs super-resolution if valid
 func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	// Parse uploaded files from the form
