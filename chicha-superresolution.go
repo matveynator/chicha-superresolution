@@ -11,8 +11,9 @@ import (
 	"math"
 	"net/http"
 	"os"
-	"sync"
 	"path/filepath"
+	"runtime"
+	"sync"
 
 	"golang.org/x/image/draw"
 )
@@ -23,7 +24,7 @@ var bootstrapCSS string
 // Main entry point for the server
 func main() {
 	// Register routes for the web interface
-	http.HandleFunc("/", uploadPageHandler) // Render the upload page
+	http.HandleFunc("/", uploadPageHandler)   // Render the upload page
 	http.HandleFunc("/upload", uploadHandler) // Handle file uploads
 
 	// Start the HTTP server
@@ -61,6 +62,7 @@ func uploadPageHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = fmt.Fprintf(w, uploadPageHTML, bootstrapCSS)
 }
+
 // uploadHandler processes uploaded images, validates their formats, and performs super-resolution if valid
 func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	// Parse uploaded files from the form
@@ -91,7 +93,7 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 
 		// Save the file to the temporary directory
 		destPath := filepath.Join(tempDir, fileHeader.Filename) // Construct the destination path
-		destFile, err := os.Create(destPath)                   // Create a new file in the temp directory
+		destFile, err := os.Create(destPath)                    // Create a new file in the temp directory
 		if err != nil {
 			http.Error(w, "Error saving uploaded file", http.StatusInternalServerError) // Handle file saving errors
 			return
@@ -149,24 +151,29 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Return the resulting image to the client
 	w.Header().Set("Content-Type", "image/jpeg") // Set the content type to JPEG
-	err = jpeg.Encode(w, result, nil)           // Encode the resulting image to JPEG and write it to the response
+	err = jpeg.Encode(w, result, nil)            // Encode the resulting image to JPEG and write it to the response
 	if err != nil {
 		http.Error(w, "Error encoding high-resolution image", http.StatusInternalServerError) // Handle encoding errors
 	}
 }
 
+// performSuperResolution реализует суперразрешение с параллелизмом
 func performSuperResolution(images []image.Image, upscaleFactor int) *image.RGBA {
+	log.Println("Starting super-resolution process...")
+
 	srcBounds := images[0].Bounds()
 	highResWidth := srcBounds.Dx() * upscaleFactor
 	highResHeight := srcBounds.Dy() * upscaleFactor
 
-	alignedImages := alignImages(images)
+	// Параллельное выравнивание изображений
+	log.Println("Aligning images before processing...")
+	alignedImages := findAndAlignImages(images)
 
+	// Инициализация матриц для накопления
 	accR := make([][]float64, highResHeight)
 	accG := make([][]float64, highResHeight)
 	accB := make([][]float64, highResHeight)
 	weights := make([][]float64, highResHeight)
-
 	for y := range accR {
 		accR[y] = make([]float64, highResWidth)
 		accG[y] = make([]float64, highResWidth)
@@ -174,26 +181,17 @@ func performSuperResolution(images []image.Image, upscaleFactor int) *image.RGBA
 		weights[y] = make([]float64, highResWidth)
 	}
 
+	// Канал для параллельной обработки пикселей
+	taskChan := make(chan *image.RGBA, len(alignedImages))
 	var wg sync.WaitGroup
-	pixelChan := make(chan func())
 
-	// Launch worker goroutines
-	for i := 0; i < 4; i++ {
+	numCPUs := runtime.NumCPU()
+	log.Printf("Using %d CPU cores for pixel accumulation...", numCPUs)
+
+	// Горутины для обработки пикселей
+	for i := 0; i < numCPUs; i++ {
 		go func() {
-			for task := range pixelChan {
-				task()
-			}
-		}()
-	}
-
-	for _, img := range alignedImages {
-		highResImgTmp := image.NewRGBA(image.Rect(0, 0, highResWidth, highResHeight))
-		draw.BiLinear.Scale(highResImgTmp, highResImgTmp.Bounds(), img, img.Bounds(), draw.Over, nil)
-
-		wg.Add(1)
-		func(img *image.RGBA) {
-			pixelChan <- func() {
-				defer wg.Done()
+			for img := range taskChan {
 				for y := 0; y < highResHeight; y++ {
 					for x := 0; x < highResWidth; x++ {
 						r, g, b, _ := img.At(x, y).RGBA()
@@ -203,15 +201,25 @@ func performSuperResolution(images []image.Image, upscaleFactor int) *image.RGBA
 						weights[y][x]++
 					}
 				}
+				wg.Done()
 			}
-		}(highResImgTmp)
+		}()
 	}
 
+	// Масштабирование изображений и отправка в канал
+	for _, img := range alignedImages {
+		wg.Add(1)
+		highResImgTmp := image.NewRGBA(image.Rect(0, 0, highResWidth, highResHeight))
+		draw.BiLinear.Scale(highResImgTmp, highResImgTmp.Bounds(), img, img.Bounds(), draw.Over, nil)
+		taskChan <- highResImgTmp
+	}
+
+	close(taskChan)
 	wg.Wait()
-	close(pixelChan)
 
+	// Генерация итогового изображения
+	log.Println("Combining accumulated data into the final high-resolution image...")
 	highResImg := image.NewRGBA(image.Rect(0, 0, highResWidth, highResHeight))
-
 	for y := 0; y < highResHeight; y++ {
 		for x := 0; x < highResWidth; x++ {
 			if weights[y][x] > 0 {
@@ -225,6 +233,7 @@ func performSuperResolution(images []image.Image, upscaleFactor int) *image.RGBA
 		}
 	}
 
+	log.Println("Super-resolution process completed successfully.")
 	return highResImg
 }
 
@@ -313,4 +322,113 @@ func shiftImage(img image.Image, dx, dy int) image.Image {
 	}
 
 	return shiftedImg
+}
+
+func findAndAlignImages(images []image.Image) []image.Image {
+	log.Println("Starting parallel image alignment process...")
+	reference := images[0] // Опорное изображение
+	alignedImages := make([]image.Image, len(images))
+	alignedImages[0] = reference // Первое изображение уже выровнено
+
+	var wg sync.WaitGroup
+	for i := 1; i < len(images); i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			img := images[i]
+			log.Printf("Aligning image %d with the reference image...", i)
+
+			// Найти оптимальное совмещение
+			dx, dy := findOverlap(reference, img)
+			log.Printf("Optimal shift for image %d: dx=%d, dy=%d", i, dx, dy)
+
+			// Сдвинуть текущее изображение
+			alignedImages[i] = shiftImage(img, dx, dy)
+		}(i)
+	}
+
+	// Ожидание завершения всех горутин
+	wg.Wait()
+	log.Println("Image alignment process completed.")
+	return alignedImages
+}
+
+
+func findOverlap(refImg, img image.Image) (dx, dy int) {
+	log.Println("Starting parallel overlap calculation...")
+	maxShift := 50 // Максимальное смещение (в пикселях)
+	type result struct {
+		xShift, yShift int
+		diff           float64
+	}
+	resultsChan := make(chan result, (2*maxShift+1)*(2*maxShift+1))
+	var wg sync.WaitGroup
+
+	// Параллелизация расчётов для всех комбинаций смещений
+	for yShift := -maxShift; yShift <= maxShift; yShift++ {
+		for xShift := -maxShift; xShift <= maxShift; xShift++ {
+			wg.Add(1)
+			go func(x, y int) {
+				defer wg.Done()
+				diff := calculateDifference(refImg, img, x, y)
+				resultsChan <- result{xShift: x, yShift: y, diff: diff}
+			}(xShift, yShift)
+		}
+	}
+
+	// Закрываем канал после завершения всех горутин
+	go func() {
+		wg.Wait()
+		close(resultsChan)
+	}()
+
+	// Поиск минимального значения
+	minDiff := math.MaxFloat64
+	for res := range resultsChan {
+		if res.diff < minDiff {
+			minDiff = res.diff
+			dx = res.xShift
+			dy = res.yShift
+		}
+	}
+
+	log.Printf("Found optimal overlap: dx=%d, dy=%d, minDiff=%f", dx, dy, minDiff)
+	return dx, dy
+}
+
+
+
+func calculateDifference(refImg, img image.Image, dx, dy int) float64 {
+	// Логирование только для отладки; основной вывод будет в других функциях
+	totalDiff := 0.0
+	count := 0
+
+	refBounds := refImg.Bounds()
+	imgBounds := img.Bounds()
+
+	for y := refBounds.Min.Y; y < refBounds.Max.Y; y++ {
+		for x := refBounds.Min.X; x < refBounds.Max.X; x++ {
+			imgX := x + dx
+			imgY := y + dy
+
+			if imgX < imgBounds.Min.X || imgX >= imgBounds.Max.X || imgY < imgBounds.Min.Y || imgY >= imgBounds.Max.Y {
+				continue
+			}
+
+			refR, refG, refB, _ := refImg.At(x, y).RGBA()
+			imgR, imgG, imgB, _ := img.At(imgX, imgY).RGBA()
+
+			dr := float64((refR >> 8) - (imgR >> 8))
+			dg := float64((refG >> 8) - (imgG >> 8))
+			db := float64((refB >> 8) - (imgB >> 8))
+
+			totalDiff += dr*dr + dg*dg + db*db
+			count++
+		}
+	}
+
+	if count == 0 {
+		return math.MaxFloat64
+	}
+	return totalDiff / float64(count)
 }
