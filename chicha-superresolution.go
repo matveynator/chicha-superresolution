@@ -1,6 +1,7 @@
 package main
 
 import (
+	_ "embed" // Required for embedding
 	"fmt"
 	"image"
 	"image/color"
@@ -10,10 +11,14 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"sync"
 	"path/filepath"
 
 	"golang.org/x/image/draw"
 )
+
+//go:embed static/bootstrap.min.css
+var bootstrapCSS string
 
 // Main entry point for the server
 func main() {
@@ -156,23 +161,18 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// performSuperResolution takes images and a scaling factor to generate a high-resolution image
 func performSuperResolution(images []image.Image, upscaleFactor int) *image.RGBA {
-	// Determine the dimensions of the input images
-	srcBounds := images[0].Bounds() // Use the bounds of the first image as a reference
-	highResWidth := srcBounds.Dx() * upscaleFactor  // Calculate the width of the high-resolution output
-	highResHeight := srcBounds.Dy() * upscaleFactor // Calculate the height of the high-resolution output
+	srcBounds := images[0].Bounds()
+	highResWidth := srcBounds.Dx() * upscaleFactor
+	highResHeight := srcBounds.Dy() * upscaleFactor
 
-	// Align the images
 	alignedImages := alignImages(images)
 
-	// Create arrays to accumulate RGB values and weights
-	accR := make([][]float64, highResHeight)    // Accumulated red channel values
-	accG := make([][]float64, highResHeight)    // Accumulated green channel values
-	accB := make([][]float64, highResHeight)    // Accumulated blue channel values
-	weights := make([][]float64, highResHeight) // Weights for normalization
+	accR := make([][]float64, highResHeight)
+	accG := make([][]float64, highResHeight)
+	accB := make([][]float64, highResHeight)
+	weights := make([][]float64, highResHeight)
 
-	// Initialize the arrays for accumulation and weights
 	for y := range accR {
 		accR[y] = make([]float64, highResWidth)
 		accG[y] = make([]float64, highResWidth)
@@ -180,46 +180,60 @@ func performSuperResolution(images []image.Image, upscaleFactor int) *image.RGBA
 		weights[y] = make([]float64, highResWidth)
 	}
 
-	// Accumulate pixel data from all images
-	for _, img := range alignedImages {
-		// Create a high-resolution version of the image
-		highResImgTmp := image.NewRGBA(image.Rect(0, 0, highResWidth, highResHeight))
-		// Scale the image into the high-resolution image using bilinear interpolation
-		draw.BiLinear.Scale(highResImgTmp, highResImgTmp.Bounds(), img, img.Bounds(), draw.Over, nil)
+	var wg sync.WaitGroup
+	pixelChan := make(chan func())
 
-		// Now accumulate the pixel data
-		for y := 0; y < highResHeight; y++ {
-			for x := 0; x < highResWidth; x++ {
-				r, g, b, _ := highResImgTmp.At(x, y).RGBA()
-				accR[y][x] += float64(r >> 8)
-				accG[y][x] += float64(g >> 8)
-				accB[y][x] += float64(b >> 8)
-				weights[y][x]++
+	// Launch worker goroutines
+	for i := 0; i < 4; i++ {
+		go func() {
+			for task := range pixelChan {
+				task()
 			}
-		}
+		}()
 	}
 
-	// Create an empty RGBA image for the high-resolution output
+	for _, img := range alignedImages {
+		highResImgTmp := image.NewRGBA(image.Rect(0, 0, highResWidth, highResHeight))
+		draw.BiLinear.Scale(highResImgTmp, highResImgTmp.Bounds(), img, img.Bounds(), draw.Over, nil)
+
+		wg.Add(1)
+		func(img *image.RGBA) {
+			pixelChan <- func() {
+				defer wg.Done()
+				for y := 0; y < highResHeight; y++ {
+					for x := 0; x < highResWidth; x++ {
+						r, g, b, _ := img.At(x, y).RGBA()
+						accR[y][x] += float64(r >> 8)
+						accG[y][x] += float64(g >> 8)
+						accB[y][x] += float64(b >> 8)
+						weights[y][x]++
+					}
+				}
+			}
+		}(highResImgTmp)
+	}
+
+	wg.Wait()
+	close(pixelChan)
+
 	highResImg := image.NewRGBA(image.Rect(0, 0, highResWidth, highResHeight))
 
-	// Normalize accumulated values and generate the final high-resolution image
 	for y := 0; y < highResHeight; y++ {
 		for x := 0; x < highResWidth; x++ {
 			if weights[y][x] > 0 {
-				// Normalize and clamp the values
 				r := uint8(math.Min(math.Round(accR[y][x]/weights[y][x]), 255))
 				g := uint8(math.Min(math.Round(accG[y][x]/weights[y][x]), 255))
 				b := uint8(math.Min(math.Round(accB[y][x]/weights[y][x]), 255))
 				highResImg.SetRGBA(x, y, color.RGBA{R: r, G: g, B: b, A: 255})
 			} else {
-				// Set a default color (white)
 				highResImg.SetRGBA(x, y, color.RGBA{R: 255, G: 255, B: 255, A: 255})
 			}
 		}
 	}
 
-	return highResImg // Return the final high-resolution image
+	return highResImg
 }
+
 
 // alignImages aligns a list of images based on the first image
 func alignImages(images []image.Image) []image.Image {
