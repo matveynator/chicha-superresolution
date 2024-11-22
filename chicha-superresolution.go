@@ -314,15 +314,17 @@ func shiftImage(img image.Image, dx, dy int) image.Image {
 			srcY := y - dy
 
 			if srcX < bounds.Min.X || srcX >= bounds.Max.X || srcY < bounds.Min.Y || srcY >= bounds.Max.Y {
-				shiftedImg.Set(x, y, color.Black)
+				shiftedImg.Set(x, y, color.Black) // Заполняем пустые области чёрным
 			} else {
 				shiftedImg.Set(x, y, img.At(srcX, srcY))
 			}
 		}
 	}
 
+	log.Printf("Image shifted by dx=%d, dy=%d", dx, dy)
 	return shiftedImg
 }
+
 
 func findAndAlignImages(images []image.Image) []image.Image {
 	log.Println("Starting parallel image alignment process...")
@@ -364,13 +366,17 @@ func findOverlap(refImg, img image.Image) (dx, dy int) {
 	resultsChan := make(chan result, (2*maxShift+1)*(2*maxShift+1))
 	var wg sync.WaitGroup
 
-	// Параллелизация расчётов для всех комбинаций смещений
+	// Сосредоточьтесь на центральной области изображения
+	refBounds := refImg.Bounds()
+	centerX := refBounds.Min.X + (refBounds.Dx() / 2)
+	centerY := refBounds.Min.Y + (refBounds.Dy() / 2)
+
 	for yShift := -maxShift; yShift <= maxShift; yShift++ {
 		for xShift := -maxShift; xShift <= maxShift; xShift++ {
 			wg.Add(1)
 			go func(x, y int) {
 				defer wg.Done()
-				diff := calculateDifference(refImg, img, x, y)
+				diff := calculateDifference(refImg, img, centerX+x, centerY+y)
 				resultsChan <- result{xShift: x, yShift: y, diff: diff}
 			}(xShift, yShift)
 		}
