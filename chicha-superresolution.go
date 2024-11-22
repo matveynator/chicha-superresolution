@@ -163,22 +163,25 @@ func performSuperResolution(images []image.Image, upscaleFactor int) *image.RGBA
 	highResWidth := srcBounds.Dx() * upscaleFactor  // Calculate the width of the high-resolution output
 	highResHeight := srcBounds.Dy() * upscaleFactor // Calculate the height of the high-resolution output
 
+	// Align the images
+	alignedImages := alignImages(images)
+
 	// Create arrays to accumulate RGB values and weights
-	accR := make([][]float64, highResHeight) // Array to store accumulated red channel values
-	accG := make([][]float64, highResHeight) // Array to store accumulated green channel values
-	accB := make([][]float64, highResHeight) // Array to store accumulated blue channel values
-	weights := make([][]float64, highResHeight) // Array to store weights for normalization
+	accR := make([][]float64, highResHeight)    // Accumulated red channel values
+	accG := make([][]float64, highResHeight)    // Accumulated green channel values
+	accB := make([][]float64, highResHeight)    // Accumulated blue channel values
+	weights := make([][]float64, highResHeight) // Weights for normalization
 
 	// Initialize the arrays for accumulation and weights
 	for y := range accR {
-		accR[y] = make([]float64, highResWidth) // Initialize the red channel array for this row
-		accG[y] = make([]float64, highResWidth) // Initialize the green channel array for this row
-		accB[y] = make([]float64, highResWidth) // Initialize the blue channel array for this row
-		weights[y] = make([]float64, highResWidth) // Initialize the weights array for this row
+		accR[y] = make([]float64, highResWidth)
+		accG[y] = make([]float64, highResWidth)
+		accB[y] = make([]float64, highResWidth)
+		weights[y] = make([]float64, highResWidth)
 	}
 
 	// Accumulate pixel data from all images
-	for _, img := range images {
+	for _, img := range alignedImages {
 		// Create a high-resolution version of the image
 		highResImgTmp := image.NewRGBA(image.Rect(0, 0, highResWidth, highResHeight))
 		// Scale the image into the high-resolution image using bilinear interpolation
@@ -202,14 +205,14 @@ func performSuperResolution(images []image.Image, upscaleFactor int) *image.RGBA
 	// Normalize accumulated values and generate the final high-resolution image
 	for y := 0; y < highResHeight; y++ {
 		for x := 0; x < highResWidth; x++ {
-			if weights[y][x] > 0 { // Normalize only if there are contributions to this pixel
-				// Normalize the accumulated values to calculate the final pixel value
-				r := uint8(math.Min(math.Round(accR[y][x]/weights[y][x]), 255)) // Normalize red and clamp to 255
-				g := uint8(math.Min(math.Round(accG[y][x]/weights[y][x]), 255)) // Normalize green and clamp to 255
-				b := uint8(math.Min(math.Round(accB[y][x]/weights[y][x]), 255)) // Normalize blue and clamp to 255
-				highResImg.SetRGBA(x, y, color.RGBA{R: r, G: g, B: b, A: 255})  // Set the calculated RGBA value
+			if weights[y][x] > 0 {
+				// Normalize and clamp the values
+				r := uint8(math.Min(math.Round(accR[y][x]/weights[y][x]), 255))
+				g := uint8(math.Min(math.Round(accG[y][x]/weights[y][x]), 255))
+				b := uint8(math.Min(math.Round(accB[y][x]/weights[y][x]), 255))
+				highResImg.SetRGBA(x, y, color.RGBA{R: r, G: g, B: b, A: 255})
 			} else {
-				// If no contributions, set a default color (white) to prevent black pixels
+				// Set a default color (white)
 				highResImg.SetRGBA(x, y, color.RGBA{R: 255, G: 255, B: 255, A: 255})
 			}
 		}
@@ -218,3 +221,88 @@ func performSuperResolution(images []image.Image, upscaleFactor int) *image.RGBA
 	return highResImg // Return the final high-resolution image
 }
 
+// alignImages aligns a list of images based on the first image
+func alignImages(images []image.Image) []image.Image {
+	reference := images[0] // Use the first image as the reference
+	alignedImages := []image.Image{reference}
+
+	for i := 1; i < len(images); i++ {
+		img := images[i]
+		dx, dy := estimateTranslation(reference, img)
+		alignedImg := shiftImage(img, dx, dy)
+		alignedImages = append(alignedImages, alignedImg)
+	}
+
+	return alignedImages
+}
+
+// estimateTranslation estimates the shift (dx, dy) between two images
+func estimateTranslation(refImg, img image.Image) (dx, dy int) {
+	// Define the maximum shift to search
+	maxShift := 10 // pixels
+
+	minSSD := math.MaxFloat64
+	bestDx, bestDy := 0, 0
+
+	for yShift := -maxShift; yShift <= maxShift; yShift++ {
+		for xShift := -maxShift; xShift <= maxShift; xShift++ {
+			ssd := computeSSD(refImg, img, xShift, yShift)
+			if ssd < minSSD {
+				minSSD = ssd
+				bestDx = xShift
+				bestDy = yShift
+			}
+		}
+	}
+
+	return bestDx, bestDy
+}
+
+// computeSSD computes the Sum of Squared Differences between two images with a given shift
+func computeSSD(refImg, img image.Image, xShift, yShift int) float64 {
+	ssd := 0.0
+	bounds := refImg.Bounds()
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			refX := x
+			refY := y
+			imgX := x + xShift
+			imgY := y + yShift
+
+			if imgX < bounds.Min.X || imgX >= bounds.Max.X || imgY < bounds.Min.Y || imgY >= bounds.Max.Y {
+				continue
+			}
+
+			refR, refG, refB, _ := refImg.At(refX, refY).RGBA()
+			imgR, imgG, imgB, _ := img.At(imgX, imgY).RGBA()
+
+			dr := float64((refR >> 8) - (imgR >> 8))
+			dg := float64((refG >> 8) - (imgG >> 8))
+			db := float64((refB >> 8) - (imgB >> 8))
+
+			ssd += dr*dr + dg*dg + db*db
+		}
+	}
+	return ssd
+}
+
+// shiftImage shifts an image by dx and dy pixels
+func shiftImage(img image.Image, dx, dy int) image.Image {
+	bounds := img.Bounds()
+	shiftedImg := image.NewRGBA(bounds)
+
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			srcX := x - dx
+			srcY := y - dy
+
+			if srcX < bounds.Min.X || srcX >= bounds.Max.X || srcY < bounds.Min.Y || srcY >= bounds.Max.Y {
+				shiftedImg.Set(x, y, color.Black)
+			} else {
+				shiftedImg.Set(x, y, img.At(srcX, srcY))
+			}
+		}
+	}
+
+	return shiftedImg
+}
