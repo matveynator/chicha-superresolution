@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"golang.org/x/image/draw"
 )
 
 // Main entry point for the server
@@ -145,7 +146,7 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Maximum scaling factor determined: %dx", maxScale)
 
 	// Perform super-resolution
-	result := performSuperResolution(imagePaths, maxScale) // Call the function to generate the high-resolution image
+	result := performSuperResolution(images, maxScale) // Call the function to generate the high-resolution image
 
 	// Return the resulting image to the client
 	w.Header().Set("Content-Type", "image/jpeg") // Set the content type to JPEG
@@ -155,36 +156,14 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-
-// performSuperResolution takes image file paths and a scaling factor to generate a high-resolution image
-func performSuperResolution(imagePaths []string, upscaleFactor int) *image.RGBA {
-	// Open and decode all images
-	var images []image.Image // A slice to store decoded images
-	for _, path := range imagePaths {
-		// Open the image file
-		file, err := os.Open(path) // Open the file for reading
-		if err != nil {
-			log.Fatalf("Error opening file %s: %v", path, err) // Log and terminate if the file cannot be opened
-		}
-		defer file.Close() // Ensure the file is closed after processing
-
-		// Decode the image to determine format
-		img, _, err := image.Decode(file)
-		if err != nil {
-			log.Fatalf("Error decoding file %s: %v", path, err) // Log and terminate if decoding fails
-		}
-		images = append(images, img) // Add the decoded image to the slice
-	}
-
+// performSuperResolution takes images and a scaling factor to generate a high-resolution image
+func performSuperResolution(images []image.Image, upscaleFactor int) *image.RGBA {
 	// Determine the dimensions of the input images
 	srcBounds := images[0].Bounds() // Use the bounds of the first image as a reference
 	highResWidth := srcBounds.Dx() * upscaleFactor  // Calculate the width of the high-resolution output
 	highResHeight := srcBounds.Dy() * upscaleFactor // Calculate the height of the high-resolution output
 
-	// Create an empty RGBA image for the high-resolution output
-	highResImg := image.NewRGBA(image.Rect(0, 0, highResWidth, highResHeight))
-
-	// Arrays to accumulate RGB values and weights
+	// Create arrays to accumulate RGB values and weights
 	accR := make([][]float64, highResHeight) // Array to store accumulated red channel values
 	accG := make([][]float64, highResHeight) // Array to store accumulated green channel values
 	accB := make([][]float64, highResHeight) // Array to store accumulated blue channel values
@@ -200,22 +179,25 @@ func performSuperResolution(imagePaths []string, upscaleFactor int) *image.RGBA 
 
 	// Accumulate pixel data from all images
 	for _, img := range images {
-		// Iterate over the original image pixels
-		for y := 0; y < srcBounds.Dy(); y++ {
-			for x := 0; x < srcBounds.Dx(); x++ {
-				// Map the pixel to high-resolution coordinates
-				hrX := x * upscaleFactor // High-resolution X coordinate
-				hrY := y * upscaleFactor // High-resolution Y coordinate
+		// Create a high-resolution version of the image
+		highResImgTmp := image.NewRGBA(image.Rect(0, 0, highResWidth, highResHeight))
+		// Scale the image into the high-resolution image using bilinear interpolation
+		draw.BiLinear.Scale(highResImgTmp, highResImgTmp.Bounds(), img, img.Bounds(), draw.Over, nil)
 
-				// Get RGB values from the original image (scaled to 8-bit)
-				r, g, b, _ := img.At(x, y).RGBA() // Extract RGBA values (16-bit)
-				accR[hrY][hrX] += float64(r >> 8) // Accumulate red channel (convert to 8-bit)
-				accG[hrY][hrX] += float64(g >> 8) // Accumulate green channel (convert to 8-bit)
-				accB[hrY][hrX] += float64(b >> 8) // Accumulate blue channel (convert to 8-bit)
-				weights[hrY][hrX]++               // Increment the weight for normalization
+		// Now accumulate the pixel data
+		for y := 0; y < highResHeight; y++ {
+			for x := 0; x < highResWidth; x++ {
+				r, g, b, _ := highResImgTmp.At(x, y).RGBA()
+				accR[y][x] += float64(r >> 8)
+				accG[y][x] += float64(g >> 8)
+				accB[y][x] += float64(b >> 8)
+				weights[y][x]++
 			}
 		}
 	}
+
+	// Create an empty RGBA image for the high-resolution output
+	highResImg := image.NewRGBA(image.Rect(0, 0, highResWidth, highResHeight))
 
 	// Normalize accumulated values and generate the final high-resolution image
 	for y := 0; y < highResHeight; y++ {
